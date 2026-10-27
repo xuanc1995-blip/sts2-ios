@@ -1,0 +1,16 @@
+# runner 容量诊断：哪个 macOS 标签能拿到 runner
+name: runner 诊断
+
+on:
+  workflow_dispatch:
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        label: [ubuntu-latest, macos-latest, macos-15, macos-13]
+    runs-on: ${{ matrix.label }}
+    timeout-minutes: 5
+    steps:
+      - run: echo "ok on ${{ matrix.label }}"; uname -a; sw_vers 2>/dev/null || true
