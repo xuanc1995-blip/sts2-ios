@@ -166,52 +166,14 @@ jobs:
         run: |
           PROBE=/tmp/godot-probe
           mkdir -p "$PROBE" && cd "$PROBE"
-          cat > project.godot <<'EOF'
-config_version=5
-
-[application]
-config/name="CIProbe"
-run/main_scene="res://main.tscn"
-config/features=PackedStringArray("4.5.1", "Forward Plus")
-
-[renderer]
-renderer/rendering_method="forward_plus"
-EOF
-          cat > main.tscn <<'EOF'
-[gd_scene load_steps=1 format=3]
-[node name="Root" type="Control"]
-EOF
-          cat > export_presets.cfg <<'EOF'
-[preset.0]
-name="iOS"
-platform="iOS"
-runnable=true
-advanced_options=false
-dedicated_server=false
-custom_features=""
-export_filter="all_resources"
-include_filter=""
-exclude_filter=""
-export_path="build/CIProbe.ipa"
-patches=PackedStringArray()
-encryption_include_filters=""
-encryption_exclude_filters=""
-seed=0
-encrypt_pck=false
-encrypt_directory=false
-script_export_mode=0
-
-[preset.0.options]
-custom_template/debug=""
-custom_template/release=""
-architectures/arm64=true
-application/app_store_team_id=""
-application/bundle_identifier="com.example.ciprobe"
-application/signature=""
-application/short_version="0.0.1"
-application/version="0.0.1"
-application/min_ios_version="14.0"
-EOF
+          # 文件正文经 base64 单行写入，规避 YAML 块标量对 heredoc 缩进的限制
+          echo 'Y29uZmlnX3ZlcnNpb249NQoKW2FwcGxpY2F0aW9uXQpjb25maWcvbmFtZT0iQ0lQcm9iZSIKcnVuL21haW5fc2NlbmU9InJlczovL21haW4udHNjbiIKY29uZmlnL2ZlYXR1cmVzPVBhY2tlZFN0cmluZ0FycmF5KCI0LjUuMSIsICJGb3J3YXJkIFBsdXMiKQoKW3JlbmRlcmVyXQpyZW5kZXJlci9yZW5kZXJpbmdfbWV0aG9kPSJmb3J3YXJkX3BsdXMiCg==' \
+            | base64 -d > project.godot
+          echo 'W2dkX3NjZW5lIGxvYWRfc3RlcHM9MSBmb3JtYXQ9M10KW25vZGUgbmFtZT0iUm9vdCIgdHlwZT0iQ29udHJvbCJdCg==' \
+            | base64 -d > main.tscn
+          echo 'W3ByZXNldC4wXQpuYW1lPSJpT1MiCnBsYXRmb3JtPSJpT1MiCnJ1bm5hYmxlPXRydWUKYWR2YW5jZWRfb3B0aW9ucz1mYWxzZQpkZWRpY2F0ZWRfc2VydmVyPWZhbHNlCmN1c3RvbV9mZWF0dXJlcz0iIgpleHBvcnRfZmlsdGVyPSJhbGxfcmVzb3VyY2VzIgppbmNsdWRlX2ZpbHRlcj0iIgpleGNsdWRlX2ZpbHRlcj0iIgpleHBvcnRfcGF0aD0iYnVpbGQvQ0lQcm9iZS5pcGEiCnBhdGNoZXM9UGFja2VkU3RyaW5nQXJyYXkoKQplbmNyeXB0aW9uX2luY2x1ZGVfZmlsdGVycz0iIgplbmNyeXB0aW9uX2V4Y2x1ZGVfZmlsdGVycz0iIgpzZWVkPTAKZW5jcnlwdF9wY2s9ZmFsc2UKZW5jcnlwdF9kaXJlY3Rvcnk9ZmFsc2UKc2NyaXB0X2V4cG9ydF9tb2RlPTAKCltwcmVzZXQuMC5vcHRpb25zXQpjdXN0b21fdGVtcGxhdGUvZGVidWc9IiIKY3VzdG9tX3RlbXBsYXRlL3JlbGVhc2U9IiIKYXJjaGl0ZWN0dXJlcy9hcm02ND10cnVlCmFwcGxpY2F0aW9uL2FwcF9zdG9yZV90ZWFtX2lkPSIiCmFwcGxpY2F0aW9uL2J1bmRsZV9pZGVudGlmaWVyPSJjb20uZXhhbXBsZS5jaXByb2JlIgphcHBsaWNhdGlvbi9zaWduYXR1cmU9IiIKYXBwbGljYXRpb24vc2hvcnRfdmVyc2lvbj0iMC4wLjEiCmFwcGxpY2F0aW9uL3ZlcnNpb249IjAuMC4xIgphcHBsaWNhdGlvbi9taW5faW9zX3ZlcnNpb249IjE0LjAiCg==' \
+            | base64 -d > export_presets.cfg
+          cat project.godot main.tscn export_presets.cfg | head -20
           TE0=$(date +%s)
           "$GODOT" --headless --path "$PROBE" --export-release "iOS" build/CIProbe.ipa 2>&1 | tee export.log
           ERC=${PIPESTATUS[0]}
@@ -240,30 +202,14 @@ EOF
         run: |
           SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path)
           WORK=/tmp/ipa-probe && mkdir -p "$WORK" && cd "$WORK"
-          cat > hello.m <<'EOF'
-          #import <Foundation/Foundation.h>
-          int main(int argc, const char *argv[]) {
-              NSLog(@"ci-probe ad-hoc ipa: ok");
-              return 0;
-          }
-          EOF
+          echo 'I2ltcG9ydCA8Rm91bmRhdGlvbi9Gb3VuZGF0aW9uLmg+CmludCBtYWluKGludCBhcmdjLCBjb25zdCBjaGFyICphcmd2W10pIHsKICAgIE5TTG9nKEAiY2ktcHJvYmUgYWQtaG9jIGlwYTogb2siKTsKICAgIHJldHVybiAwOwp9Cg==' \
+            | base64 -d > hello.m
           clang -arch arm64 -isysroot "$SYSROOT" -framework Foundation -o hello hello.m
           file hello | grep -q arm64 || { echo "clang 未产出 arm64"; exit 1; }
           mkdir -p CIProbe.app
           cp hello CIProbe.app/
-          cat > CIProbe.app/Info.plist <<'EOF'
-          <?xml version="1.0" encoding="UTF-8"?>
-          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-          <plist version="1.0"><dict>
-          <key>CFBundleExecutable</key><string>hello</string>
-          <key>CFBundleIdentifier</key><string>com.example.ciprobe</string>
-          <key>CFBundleName</key><string>CIProbe</string>
-          <key>CFBundleShortVersionString</key><string>0.0.1</string>
-          <key>CFBundleVersion</key><string>0.0.1</string>
-          <key>MinimumOSVersion</key><string>14.0</string>
-          <key>Platform</key><string>iPhoneOS</string>
-          </dict></plist>
-          EOF
+          echo 'PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0iVVRGLTgiPz4KPCFET0NUWVBFIHBsaXN0IFBVQkxJQyAiLS8vQXBwbGUvL0RURCBQTElTVCAxLjAvL0VOIiAiaHR0cDovL3d3dy5hcHBsZS5jb20vRFREcy9Qcm9wZXJ0eUxpc3QtMS4wLmR0ZCI+CjxwbGlzdCB2ZXJzaW9uPSIxLjAiPjxkaWN0Pgo8a2V5PkNGQnVuZGxlRXhlY3V0YWJsZTwva2V5PjxzdHJpbmc+aGVsbG88L3N0cmluZz4KPGtleT5DRkJ1bmRsZUlkZW50aWZpZXI8L2tleT48c3RyaW5nPmNvbS5leGFtcGxlLmNpcHJvYmU8L3N0cmluZz4KPGtleT5DRkJ1bmRsZU5hbWU8L2tleT48c3RyaW5nPkNJUHJvYmU8L3N0cmluZz4KPGtleT5DRkJ1bmRsZVNob3J0VmVyc2lvblN0cmluZzwva2V5PjxzdHJpbmc+MC4wLjE8L3N0cmluZz4KPGtleT5DRkJ1bmRsZVZlcnNpb248L2tleT48c3RyaW5nPjAuMC4xPC9zdHJpbmc+CjxrZXk+TWluaW11bU9TVmVyc2lvbjwva2V5PjxzdHJpbmc+MTQuMDwvc3RyaW5nPgo8a2V5PlBsYXRmb3JtPC9rZXk+PHN0cmluZz5pUGhvbmVPUzwvc3RyaW5nPgo8L2RpY3Q+PC9wbGlzdD4K' \
+            | base64 -d > CIProbe.app/Info.plist
           codesign -s - --force CIProbe.app
           codesign -dv CIProbe.app 2>&1 | grep -E 'Identifier|Format|Signature' || true
           mkdir -p Payload
