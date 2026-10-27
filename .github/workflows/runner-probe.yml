@@ -9,7 +9,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        label: [ubuntu-latest, macos-latest, macos-15, macos-13]
+        label: [ubuntu-latest, windows-latest, macos-latest, macos-15-x64, macos-15-arm64, macos-14-arm64, macos-13-arm64]
     runs-on: ${{ matrix.label }}
     timeout-minutes: 5
     steps:
