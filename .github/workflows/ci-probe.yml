@@ -1,0 +1,284 @@
+# CI 探针：验证 macOS runner 上的工具链与构建机制（无密钥、无版权文件）
+#
+# 本工作流是 T05 的实跑验证。它只动公开物料（fork 源码、公开 NuGet、Godot 官方发行物、
+# runner 自带 Xcode），不触碰游戏 pck / sts2.dll 真品 / FMOD / Spine，因此可在公开仓库
+# 的免费 macOS runner 上安全运行。
+#
+# 验证项（每项带耗时记录，结果写入 GITHUB_STEP_SUMMARY）：
+#   A. runner 环境：macOS 版本、架构、Xcode 版本、iOS SDK
+#   B. .NET 9 SDK 安装 + 织入器/补丁库编译（仓库公开代码）
+#   C. 桩程序集 NativeAOT ios-arm64 publish → sts2.dylib（全链路最难一步，用空壳 dll 代替真品）
+#   D. Godot 4.5.1 mono + mono 版 iOS 导出模板的获取与 headless 运行
+#   E. 最小 Godot 工程 headless iOS 导出（Godot → Xcode → ipa 机制）
+#   F. iOS 原生交叉编译 + ad-hoc codesign + Payload 打包成 ipa（无账号签名机制）
+
+name: CI 探针（T05）
+
+on:
+  push:
+    paths:
+      - .github/workflows/ci-probe.yml
+      - src/**
+      - ios-export/**
+      - tools/**
+      - .github/workflows/ci-probe.yml
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-probe-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  probe:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 记录开始时间
+        run: echo "T0=$(date +%s)" >> "$GITHUB_ENV"
+
+      # ── A. runner 环境快照 ──────────────────────────────────────────
+      - name: A · runner 环境快照
+        run: |
+          {
+            echo '## A · runner 环境快照'
+            echo
+            echo '| 项 | 值 |'
+            echo '|---|---|'
+            echo "| macOS | $(sw_vers -productVersion) |"
+            echo "| 架构 | $(uname -m) |"
+            echo "| runner | ${{ runner.name }} / ${{ runner.os }} |"
+            echo "| xcode-select | $(xcode-select -p) |"
+            echo "| Xcode | $(xcodebuild -version 2>&1 | tr '\n' ' ') |"
+            echo "| iOS SDK | $(xcodebuild -showsdks 2>/dev/null | grep -oE 'iphoneos[0-9.]+' | sort -u | tr '\n' ' ') |"
+            echo "| 已装 Xcode | $(ls /Applications | grep -i '^Xcode' | tr '\n' ' ') |"
+            echo
+            echo '```'
+            xcodebuild -showsdks 2>&1 | grep -E 'iOS|watchOS|tvOS|visionOS' || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── B. .NET 9 SDK + 公开代码编译 ────────────────────────────────
+      - name: B · 安装 .NET 9 SDK
+        run: |
+          curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          bash /tmp/dotnet-install.sh --channel 9.0 --install-dir "$HOME/.dotnet9"
+          echo "$HOME/.dotnet9" >> "$GITHUB_PATH"
+          echo "DOTNET_ROOT=$HOME/.dotnet9" >> "$GITHUB_ENV"
+          dotnet --info | head -20
+
+      - name: B · 编译织入器 + 补丁库
+        run: |
+          dotnet build src/STS2Weaver -c Release --nologo -v m
+          dotnet build src/STS2MobileIos -c Release --nologo -v m
+          test -f src/STS2Weaver/bin/Release/net9.0/STS2Weaver.dll
+          test -f src/STS2MobileIos/bin/Release/net9.0/STS2MobileIos.dll
+
+      - name: B · 小结
+        run: |
+          {
+            echo '## B · .NET 9 + 公开代码编译'
+            echo
+            echo '| 项 | 结果 |'
+            echo '|---|---|'
+            echo "| .NET SDK | $(dotnet --list-sdks | tr '\n' ' ') |"
+            echo '| STS2Weaver 编译 | ✅ |'
+            echo '| STS2MobileIos 编译 | ✅ |'
+            echo "| 耗时 | $(( $(date +%s) - T0 ))s（自任务开始累计） |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── C. 桩程序集 NativeAOT ios-arm64 ─────────────────────────────
+      # 用 dotnet new classlib 生成一个空的 sts2.dll（程序集名匹配 Godot 硬耦合），
+      # 放进 prebuilt/ 走完整的 dotnet publish -r ios-arm64。不含任何游戏代码，
+      # 但完整验证：Godot.NET.Sdk 4.5.1 还原、ILC 交叉编译、ios-arm64 runtime pack。
+      - name: C · 桩程序集 NativeAOT ios-arm64 publish
+        run: |
+          mkdir -p /tmp/stub && cd /tmp/stub
+          dotnet new classlib -n sts2 -o . --force -f net9.0
+          dotnet build -c Release -o "$GITHUB_WORKSPACE/ios-export/prebuilt" --nologo -v m
+          test -f "$GITHUB_WORKSPACE/ios-export/prebuilt/sts2.dll"
+          cd "$GITHUB_WORKSPACE/ios-export"
+          TC0=$(date +%s)
+          dotnet publish sts2.csproj -c ExportRelease -r ios-arm64 \
+            -p:GodotTargetPlatform=ios --self-contained --nologo -v m 2>&1 | tee /tmp/publish.log
+          PUBRC=${PIPESTATUS[0]}
+          TC1=$(date +%s)
+          DYLIB=$(find . -name 'sts2.dylib' -path '*publish*' | head -1)
+          {
+            echo '## C · 桩程序集 NativeAOT ios-arm64'
+            echo
+            echo '| 项 | 结果 |'
+            echo '|---|---|'
+            echo "| dotnet publish 退出码 | $PUBRC |"
+            echo "| sts2.dylib | ${DYLIB:-未产出} |"
+            echo '| arm64 校验 |'
+            if [ -n "$DYLIB" ]; then
+              echo "| file | $(file "$DYLIB" | cut -d: -f2-) |"
+              echo '| ✅ ILC 在 runner 上交叉编译 ios-arm64 成功 |  |'
+            else
+              echo '| ❌ NativeAOT 未产出 | 看 /tmp/publish.log |'
+              echo
+              echo '```'
+              grep -iE 'error|fatal' /tmp/publish.log | tail -30
+              echo '```'
+            fi
+            echo "| 耗时 | $((TC1 - TC0))s |"
+          } >> "$GITHUB_STEP_SUMMARY"
+          # 这一步是全链路最贵的验证，失败即整个 T05 判据动摇，不放过
+          [ "$PUBRC" = 0 ] || exit 1
+          [ -n "$DYLIB" ] || exit 1
+
+      # ── D. Godot 4.5.1 mono + iOS 导入模板 ──────────────────────────
+      - name: D · 获取 Godot 4.5.1 mono + mono 版 iOS 导出模板
+        run: |
+          GD=4.5.1-stable
+          curl -fsSL -o /tmp/godot.zip "https://github.com/godotengine/godot/releases/download/$GD/Godot_v4.5.1-stable_mono_macos.universal.zip"
+          curl -fsSL -o /tmp/templates.tpz "https://github.com/godotengine/godot/releases/download/$GD/Godot_v4.5.1-stable_mono_export_templates.tpz"
+          unzip -q /tmp/godot.zip -d /tmp/godot-bin
+          GODOT=$(find /tmp/godot-bin -maxdepth 2 -type f -name 'Godot*' ! -name '*.zip' | head -1)
+          chmod +x "$GODOT"
+          echo "GODOT=$GODOT" >> "$GITHUB_ENV"
+          TPL_DIR="$HOME/Library/Application Support/Godot/export_templates/4.5.1.stable.mono"
+          mkdir -p "$TPL_DIR"
+          unzip -q /tmp/templates.tpz -d /tmp/tpl
+          cp -R /tmp/tpl/templates/* "$TPL_DIR"/
+          {
+            echo '## D · Godot 4.5.1 mono 获取'
+            echo
+            echo '| 项 | 结果 |'
+            echo '|---|---|'
+            echo '| Godot 可执行 | ✅ |'
+            echo "| 模板目录 | $(ls "$TPL_DIR" | tr '\n' ' ') |"
+            echo '| headless 自检 |'
+            echo
+            echo '```'
+            "$GODOT" --headless --version
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── E. 最小工程 headless iOS 导出 ───────────────────────────────
+      # 用纯 GDScript 空壳工程（无 GDExtension、无 C# 脚本）跑 Godot 的 iOS 导出。
+      # 验证「Godot headless → Xcode 工程 → xcodebuild → ipa」机制本身。
+      # 真实工程的 GDExtension 库（Spine/FMOD）属私有物料，不在本探针范围。
+      - name: E · 最小 Godot 工程 headless iOS 导出
+        run: |
+          PROBE=/tmp/godot-probe
+          mkdir -p "$PROBE" && cd "$PROBE"
+          cat > project.godot <<'EOF'
+config_version=5
+
+[application]
+config/name="CIProbe"
+run/main_scene="res://main.tscn"
+config/features=PackedStringArray("4.5.1", "Forward Plus")
+
+[renderer]
+renderer/rendering_method="forward_plus"
+EOF
+          cat > main.tscn <<'EOF'
+[gd_scene load_steps=1 format=3]
+[node name="Root" type="Control"]
+EOF
+          cat > export_presets.cfg <<'EOF'
+[preset.0]
+name="iOS"
+platform="iOS"
+runnable=true
+advanced_options=false
+dedicated_server=false
+custom_features=""
+export_filter="all_resources"
+include_filter=""
+exclude_filter=""
+export_path="build/CIProbe.ipa"
+patches=PackedStringArray()
+encryption_include_filters=""
+encryption_exclude_filters=""
+seed=0
+encrypt_pck=false
+encrypt_directory=false
+script_export_mode=0
+
+[preset.0.options]
+custom_template/debug=""
+custom_template/release=""
+architectures/arm64=true
+application/app_store_team_id=""
+application/bundle_identifier="com.example.ciprobe"
+application/signature=""
+application/short_version="0.0.1"
+application/version="0.0.1"
+application/min_ios_version="14.0"
+EOF
+          TE0=$(date +%s)
+          "$GODOT" --headless --path "$PROBE" --export-release "iOS" build/CIProbe.ipa 2>&1 | tee export.log
+          ERC=${PIPESTATUS[0]}
+          TE1=$(date +%s)
+          IPA=""; [ -f build/CIProbe.ipa ] && IPA=build/CIProbe.ipa
+          XCP=$(ls -d build/*.xcodeproj 2>/dev/null | head -1)
+          {
+            echo '## E · 最小 Godot 工程 headless iOS 导出'
+            echo
+            echo '| 项 | 结果 |'
+            echo '|---|---|'
+            echo "| --export-release 退出码 | $ERC |"
+            echo "| ipa | ${IPA:-未产出} |"
+            echo "| Xcode 工程 | ${XCP:-未产出} |"
+            echo "| 耗时 | $((TE1 - TE0))s |"
+            echo
+            echo '```'
+            tail -25 export.log
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # ── F. iOS 原生交叉编译 + ad-hoc 签名 + ipa 打包 ────────────────
+      # 用 clang 直编一个 iOS arm64 小程序，ad-hoc 签名后按 Payload 结构打包。
+      # 这正是 SideStore/免费账号路线在无头环境下的签名机制。
+      - name: F · clang 交叉编译 + ad-hoc codesign + Payload ipa
+        run: |
+          SYSROOT=$(xcrun --sdk iphoneos --show-sdk-path)
+          WORK=/tmp/ipa-probe && mkdir -p "$WORK" && cd "$WORK"
+          cat > hello.m <<'EOF'
+          #import <Foundation/Foundation.h>
+          int main(int argc, const char *argv[]) {
+              NSLog(@"ci-probe ad-hoc ipa: ok");
+              return 0;
+          }
+          EOF
+          clang -arch arm64 -isysroot "$SYSROOT" -framework Foundation -o hello hello.m
+          file hello | grep -q arm64 || { echo "clang 未产出 arm64"; exit 1; }
+          mkdir -p CIProbe.app
+          cp hello CIProbe.app/
+          cat > CIProbe.app/Info.plist <<'EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0"><dict>
+          <key>CFBundleExecutable</key><string>hello</string>
+          <key>CFBundleIdentifier</key><string>com.example.ciprobe</string>
+          <key>CFBundleName</key><string>CIProbe</string>
+          <key>CFBundleShortVersionString</key><string>0.0.1</string>
+          <key>CFBundleVersion</key><string>0.0.1</string>
+          <key>MinimumOSVersion</key><string>14.0</string>
+          <key>Platform</key><string>iPhoneOS</string>
+          </dict></plist>
+          EOF
+          codesign -s - --force CIProbe.app
+          codesign -dv CIProbe.app 2>&1 | grep -E 'Identifier|Format|Signature' || true
+          mkdir -p Payload
+          cp -R CIProbe.app Payload/
+          zip -qr CIProbe.ipa Payload
+          unzip -l CIProbe.ipa | head -10
+          TF1=$(date +%s)
+          {
+            echo '## F · clang 交叉编译 + ad-hoc 签名 + ipa'
+            echo
+            echo '| 项 | 结果 |'
+            echo '|---|---|'
+            echo "| iOS SDK | $SYSROOT |"
+            echo '| clang arm64 交叉编译 | ✅ |'
+            echo '| ad-hoc codesign（无账号） | ✅ |'
+            echo "| CIProbe.ipa | $(du -h CIProbe.ipa | cut -f1) |"
+            echo "| 总耗时（全任务） | $((TF1 - T0))s |"
+          } >> "$GITHUB_STEP_SUMMARY"

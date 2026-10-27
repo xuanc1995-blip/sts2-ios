@@ -1,0 +1,194 @@
+# 全链路构建：织入 → NativeAOT → Godot 导出 → pck 三连 → 签名 → ipa
+#
+# ⚠️ 红线（继承底座 docs/BUILD_WITHOUT_MAC.md）：
+#   游戏文件（sts2.dll / .pck）与第三方库（FMOD / Spine）是版权物料，
+#   绝不能进入公开仓库或公开 CI 产物。因此本工作流**只在以下两种环境运行**：
+#     1. 私有仓库的 GitHub-hosted runner（私有分钟配额）
+#     2. 任何仓库下的自托管 macOS runner（物料放着不动，产物留在 runner 上）
+#   第一步的守卫会拒绝其余情形。
+#
+# 扩展点（本项目在底座六步链路上新增的设计，T05 定位、T06/T07/T11-T12 实现）：
+#   · D-08 织入前体检：sts2.dll 哈希对不上基线即拒织（步骤 preflight）
+#   · D-04 Mod 织入：步骤 mod-weave，位于底座织入之后、AOT 之前；
+#     输入 = 构建清单（哪些 Mod 程序集、以何顺序合并），由 Windows 工具链产出
+#   · 签名双分支：ad-hoc（免费账号 + SideStore 重签）/ developer（付费账号 +
+#     证书 + provisioning profile 注入）
+
+name: build-ios（全链路）
+
+on:
+  workflow_dispatch:
+    inputs:
+      sign_mode:
+        description: 签名模式：ad-hoc（免费账号，交给 SideStore 重签）或 developer（注入证书+profile）
+        type: choice
+        options: [ad-hoc, developer]
+        default: ad-hoc
+      mod_weave_manifest_url:
+        description: （可选）构建清单 URL：Mod 程序集 + 织入顺序，由 Windows 工具链产出
+        type: string
+        default: ''
+      keep_artifact:
+        description: 是否上传 ipa/pck 产物（仅私有仓库或自托管时可开）
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 90
+    env:
+      SIGN_MODE: ${{ inputs.sign_mode }}
+    steps:
+      - name: 守卫 · 拒绝在公开仓库 + 官方 runner 上处理版权物料
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VIS=$(curl -fsSL -H "Authorization: token $GH_TOKEN" \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY" | grep -o '"visibility": "[^"]*"' | cut -d'"' -f4)
+          echo "仓库可见性: $VIS ; runner 是否自托管: ${{ runner.is_self_hosted || false }}"
+          if [ "$VIS" = "private" ] || [ "${{ runner.is_self_hosted }}" = "true" ]; then
+            echo "✅ 环境允许处理版权物料"
+          else
+            echo "❌ 公开仓库 + 官方 runner：游戏文件与 FMOD/Spine 不能进来。改用私有仓库或自托管 runner。"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+
+      - name: 安装 .NET 9 SDK
+        run: |
+          curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh
+          bash /tmp/dotnet-install.sh --channel 9.0 --install-dir "$HOME/.dotnet9"
+          echo "$HOME/.dotnet9" >> "$GITHUB_PATH"
+          echo "DOTNET_ROOT=$HOME/.dotnet9" >> "$GITHUB_ENV"
+
+      - name: 获取 Godot 4.5.1 mono + mono 版 iOS 导出模板
+        run: |
+          GD=4.5.1-stable
+          curl -fsSL -o /tmp/godot.zip "https://github.com/godotengine/godot/releases/download/$GD/Godot_v4.5.1-stable_mono_macos.universal.zip"
+          curl -fsSL -o /tmp/templates.tpz "https://github.com/godotengine/godot/releases/download/$GD/Godot_v4.5.1-stable_mono_export_templates.tpz"
+          unzip -q /tmp/godot.zip -d /tmp/godot-bin
+          GODOT=$(find /tmp/godot-bin -maxdepth 2 -type f -name 'Godot*' ! -name '*.zip' | head -1)
+          chmod +x "$GODOT"
+          TPL_DIR="$HOME/Library/Application Support/Godot/export_templates/4.5.1.stable.mono"
+          mkdir -p "$TPL_DIR"
+          unzip -q /tmp/templates.tpz -d /tmp/tpl
+          cp -R /tmp/tpl/templates/* "$TPL_DIR"/
+          echo "STS2_GODOT_BIN=$GODOT" >> "$GITHUB_ENV"
+
+      - name: 取回私有物料（加密包，用完即删）
+        env:
+          PRIVATE_INPUTS_URL: ${{ secrets.PRIVATE_INPUTS_URL }}
+          PRIVATE_INPUTS_TOKEN: ${{ secrets.PRIVATE_INPUTS_TOKEN }}
+          PRIVATE_INPUTS_PASS: ${{ secrets.PRIVATE_INPUTS_PASS }}
+        run: |
+          # 约定：一个 gpg 加密的 tar.gz，由用户在本地用 scripts/pack-private-inputs.sh 打包：
+          #   内容 = sts2.dll + Slay the Spire 2.pck + ios-libs/ + fmod-ios/
+          #   上传到私有存储（私有 release asset / 网盘直链），URL 与令牌放进 secrets
+          curl -fsSL -H "Authorization: Bearer $PRIVATE_INPUTS_TOKEN" \
+            -o /tmp/private-inputs.tar.gz.gpg "$PRIVATE_INPUTS_URL"
+          mkdir -p "$HOME/sts2-private"
+          gpg --batch --yes --passphrase "$PRIVATE_INPUTS_PASS" \
+            -o /tmp/private-inputs.tar.gz -d /tmp/private-inputs.tar.gz.gpg
+          tar -xzf /tmp/private-inputs.tar.gz -C "$HOME/sts2-private"
+          rm -f /tmp/private-inputs.tar.gz.gpg /tmp/private-inputs.tar.gz
+          ls -R "$HOME/sts2-private" | head -40
+
+      - name: D-08 织入前体检 · sts2.dll 哈希对基线
+        run: |
+          # 基线文件 private-baseline.sha256 在仓库里（哈希不是版权物料，可公开），
+          # 由 T06 首次构建时写定：Steam build 号 + sts2.dll / pck 哈希 + MegaDot 版本串。
+          BASELINE=private-baseline.sha256
+          [ -f "$BASELINE" ] || { echo "❌ 仓库缺 $BASELINE（T06 未钉基线）"; exit 1; }
+          DLL=$(find "$HOME/sts2-private" -name 'sts2.dll' | head -1)
+          [ -n "$DLL" ] || { echo "❌ 私有物料里找不到 sts2.dll"; exit 1; }
+          ACT=$(shasum -a 256 "$DLL" | cut -d' ' -f1)
+          EXP=$(grep -E '^sts2\.dll' "$BASELINE" | awk '{print $2}')
+          echo "期望: $EXP"
+          echo "实际: $ACT"
+          [ "$ACT" = "$EXP" ] || {
+            echo "❌ sts2.dll 哈希不匹配：游戏已更新，manifest 的 39 个织入目标需逐条核对后才能织入"
+            exit 1
+          }
+          echo "✅ 基线匹配"
+
+      - name: 生成 ios-export/config.sh（签名身份来自 secrets）
+        env:
+          STS2_TEAM_ID: ${{ secrets.STS2_TEAM_ID }}
+          STS2_BUNDLE_ID: ${{ secrets.STS2_BUNDLE_ID }}
+        run: |
+          DLL=$(find "$HOME/sts2-private" -name 'sts2.dll' | head -1)
+          GAMEDIR=$(dirname "$DLL")
+          cat > ios-export/config.sh <<EOF
+          STS2_TEAM_ID="$STS2_TEAM_ID"
+          STS2_BUNDLE_ID="$STS2_BUNDLE_ID"
+          STS2_BUNDLE_ID_SIGNED="$STS2_BUNDLE_ID"
+          STS2_SIGN_IDENTITY="ad-hoc-or-developer"
+          STS2_DEVICE_UDID=""
+          STS2_GAME_APP="$(dirname "$GAMEDIR")"
+          STS2_GODOT_BIN="$STS2_GODOT_BIN"
+          STS2_DOTNET_ROOT="$HOME/.dotnet9"
+          STS2_IOS_LIBS_DIR="$HOME/sts2-private/ios-libs"
+          STS2_FMOD_STATIC_DIR="$HOME/sts2-private/fmod-ios/lib"
+          EOF
+          echo "config.sh 已生成（内容不含密钥以外物料；game app 指向 $HOME/sts2-private）"
+
+      - name: D-04 扩展点 · Mod 构建期织入（可选）
+        if: ${{ inputs.mod_weave_manifest_url != '' }}
+        env:
+          MOD_MANIFEST_URL: ${{ inputs.mod_weave_manifest_url }}
+          MOD_MANIFEST_TOKEN: ${{ secrets.PRIVATE_INPUTS_TOKEN }}
+        run: |
+          # 位置：底座织入（build-ios.sh 步骤 1）之后、依赖组装与 AOT 之前。
+          # 输入：构建清单（json：mod 程序集路径 + 织入顺序 + 各 Mod 版本）
+          #        由 windows-tools 的打包器（T12）产出，随 Mod 程序集一起加密传入。
+          # 实现：scripts/mod-weave.sh（T11/T12 时代补）——把选中的 Mod 程序集
+          #        合并进织入产物，或二次调用 STS2Weaver 织入 Mod 补丁。
+          echo "⚠️ mod-weave 尚未实现（T05 只定位扩展点），清单：$MOD_MANIFEST_URL"
+          # 占位：下载清单 → 校验签名 → 调 scripts/mod-weave.sh
+          exit 1
+
+      - name: 构建链路（织入 → 依赖组装 → GDExtension 放置 → AOT → 导出 → pck 三连）
+        run: |
+          # 底座 build-ios.sh 的步骤 0–5.5 全部是命令行，最后停在签名前（输出 GUIDE）。
+          # config.sh 就位后可直接执行；失败即响亮退出（底座语义，不静默糊过）。
+          bash ios-export/build-ios.sh
+
+      - name: 签名 · ad-hoc（免费账号，产物交 SideStore 重签）
+        if: ${{ env.SIGN_MODE == 'ad-hoc' }}
+        run: |
+          # Godot 导出的 build/StS2.xcodeproj 无头构建为未签名 .app：
+          #   xcodebuild archive（CODE_SIGNING_ALLOWED=NO）→ codesign -s - 各 framework 与 .app
+          # 内存权限 entitlement 由 build-ios.sh 步骤 5.3 写好（ent_mem.plist），
+          # ad-hoc 签名时一并带上；SideStore 重签的 profile 需含该 entitlement 才生效。
+          # 具体命令由 T07 在首次实跑后落定，此处为占位。
+          echo "TODO(T07): xcodebuild archive + codesign -s - --entitlements ent_mem.plist"
+          exit 1
+
+      - name: 签名 · developer（注入证书 + provisioning profile）
+        if: ${{ env.SIGN_MODE == 'developer' }}
+        env:
+          SIGN_CERT_P12_B64: ${{ secrets.SIGN_CERT_P12_B64 }}
+          SIGN_CERT_PASS: ${{ secrets.SIGN_CERT_PASS }}
+          MOBILEPROVISION_B64: ${{ secrets.MOBILEPROVISION_B64 }}
+        run: |
+          # 付费账号路线（T01/T04 建议）：把签名材料以 secrets 注入无头 runner。
+          #   1. 临时 keychain 导入 PKCS12
+          #   2. profile 落到 ~/Library/MobileDevice/Provisioning Profiles
+          #   3. xcodebuild archive + -exportArchive（ExportOptions.plist 指定
+          #      signingStyle=manual、provisioningProfile 映射、method=development）
+          # 内存权限 entitlement 需先在 developer.apple.com 的 App ID 能力里登记，
+          # 生成的 profile 才含 increased-memory-limit（D-06 付费账号的核心理由之一）。
+          echo "TODO(T07): keychain import + exportArchive with ExportOptions.plist"
+          exit 1
+
+      - name: 上传产物（默认不上传：公开仓库的 run 产物任何人可见）
+        if: ${{ inputs.keep_artifact == true }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: sts2-build
+          path: |
+            ios-export/build/*.ipa
+            ios-export/build/StS2.pck
+          retention-days: 1
